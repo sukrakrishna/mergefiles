@@ -1,0 +1,14 @@
+{
+  "name": "mergeanyfile",
+  "private": true,
+  "scripts": {
+    "install:all": "npm --prefix server install && npm --prefix client install",
+    "build": "npm --prefix client run build && npm --prefix server run build",
+    "start": "npm --prefix server run start",
+    "dev:server": "npm --prefix server run dev",
+    "dev:client": "npm --prefix client run dev",
+    "fixtures": "python3 server/test/make_fixtures.py",
+    "test:api": "npm --prefix server run test",
+    "test:ui": "python3 server/test/ui_test.py"
+  }
+}
