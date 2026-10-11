@@ -2,8 +2,9 @@ import { useRef, useState, type CSSProperties, type DragEvent } from 'react'
 import { DndContext, closestCenter, KeyboardSensor, PointerSensor, useSensor, useSensors, type DragEndEvent } from '@dnd-kit/core'
 import { SortableContext, arrayMove, sortableKeyboardCoordinates, useSortable, verticalListSortingStrategy } from '@dnd-kit/sortable'
 import { CSS } from '@dnd-kit/utilities'
-import { AlertCircle, CheckCircle2, GripVertical, Loader2, Trash2, ArrowUpFromLine } from 'lucide-react'
+import { AlertCircle, CheckCircle2, GripVertical, Loader2, RotateCw, Trash2, ArrowUpFromLine } from 'lucide-react'
 import type { FileInfo, Limits } from '../api'
+import type { UploadItem } from '../types'
 import { KIND_LABEL, formatBytes } from '../format'
 
 const EXT_TAG: Record<string, string> = { pdf: 'PDF', doc: 'DOC', docx: 'DOC', xls: 'XLS', xlsx: 'XLS', ppt: 'PPT', pptx: 'PPT', jpg: 'JPG', jpeg: 'JPG', png: 'PNG' }
@@ -90,18 +91,65 @@ function FileRow({ file, index, onRemove }: { file: FileInfo; index: number; onR
   )
 }
 
+const nameExt = (name: string) => (/\.([A-Za-z0-9]{1,5})$/.exec(name)?.[1] ?? '').toLowerCase()
+
+/** "3.2 of 8.5 MB" (or KB for small totals). */
+function progressText(loaded: number, total: number): string {
+  const [div, unit] = total >= 1_000_000 ? [1_000_000, 'MB'] : [1_000, 'KB']
+  return `${(loaded / div).toFixed(1)} of ${(total / div).toFixed(1)} ${unit}`
+}
+
+/** A file that is still being sent (or failed on the way). Shown immediately, before the upload finishes. */
+function UploadRow({ item, index, onRetry, onCancel }: { item: UploadItem; index: number; onRetry: (key: string) => void; onCancel: (key: string) => void }) {
+  const failed = item.status === 'failed'
+  const pct = item.size > 0 ? Math.round((item.loaded / item.size) * 100) : 0
+  return (
+    <li className={`file-row k-upload ${failed ? 'has-error' : ''}`}>
+      <span className="grip-spacer" aria-hidden />
+      <span className="file-idx" aria-hidden>{String(index).padStart(2, '0')}</span>
+      <span className="file-icon" aria-hidden>{EXT_TAG[nameExt(item.name)] ?? '···'}</span>
+      <div className="file-main">
+        <div className="file-name" title={item.name}>{item.name}</div>
+        <div className="file-meta">
+          {item.status === 'uploading' && <>Uploading · {progressText(item.loaded, item.size)}</>}
+          {item.status === 'waiting' && <>Waiting to upload · {formatBytes(item.size)}</>}
+          {failed && <>{formatBytes(item.size)}</>}
+        </div>
+        {item.status === 'uploading' && (
+          <div className="mini-bar" role="progressbar" aria-label={`Uploading ${item.name}`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={pct}><i style={{ width: `${pct}%` }} /></div>
+        )}
+        {failed && (
+          <div className="file-error">
+            {item.name} could not be uploaded: {item.error}
+            <button className="btn btn-sm retry-btn" onClick={() => onRetry(item.key)} aria-label={`Retry ${item.name}`}><RotateCw size={13} /> Retry</button>
+          </div>
+        )}
+      </div>
+      <span className="file-pages" />
+      <span className={`chip ${failed ? 'chip-error' : 'chip-uploading'}`}>
+        {failed ? <><AlertCircle size={13} /> Failed</> : <><Loader2 size={13} className="spin" /> {item.status === 'uploading' ? 'Uploading' : 'Waiting'}</>}
+      </span>
+      <button className="icon-btn danger" onClick={() => onCancel(item.key)} aria-label={failed ? `Remove ${item.name}` : `Cancel upload of ${item.name}`}><Trash2 size={16} /></button>
+    </li>
+  )
+}
+
 interface Props {
   files: FileInfo[]
+  uploads: UploadItem[]
+  batchDone: { bytes: number; files: number }
   limits: Limits | null
   uploading: boolean
   merging: boolean
   onAdd: (files: File[]) => void
   onRemove: (id: string) => void
   onReorder: (ids: string[]) => void
+  onRetryUpload: (key: string) => void
+  onCancelUpload: (key: string) => void
   onContinue: () => void
 }
 
-export function UploadStep({ files, limits, uploading, merging, onAdd, onRemove, onReorder, onContinue }: Props) {
+export function UploadStep({ files, uploads, batchDone, limits, uploading, merging, onAdd, onRemove, onRetryUpload, onCancelUpload, onReorder, onContinue }: Props) {
   const input = useRef<HTMLInputElement>(null)
   const [over, setOver] = useState(false)
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 5 } }), useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }))
@@ -123,11 +171,16 @@ export function UploadStep({ files, limits, uploading, merging, onAdd, onRemove,
   const failed = files.filter((f) => f.status === 'error').length
   const pages = ready.reduce((n, f) => n + (f.pageCount ?? 0), 0)
   const totalSize = ready.reduce((n, f) => n + f.size, 0)
-  const empty = files.length === 0
+  const empty = files.length === 0 && uploads.length === 0
+  const sending = uploads.filter((u) => u.status !== 'failed')
+  const sentBytes = batchDone.bytes + sending.reduce((n, u) => n + u.loaded, 0)
+  const sendTotal = batchDone.bytes + sending.reduce((n, u) => n + u.size, 0)
+  const sendPct = sendTotal > 0 ? Math.round((sentBytes / sendTotal) * 100) : 0
+  const sendLabel = sending.length ? `Uploading ${progressText(sentBytes, sendTotal)}` : ''
 
   const chooseButton = (cls: string) => (
     <button className={`btn ${cls}`} onClick={() => input.current?.click()} disabled={uploading}>
-      {uploading ? <><Loader2 size={16} className="spin" /> Uploading…</> : 'Choose files'}
+      {uploading ? <><Loader2 size={16} className="spin" /> {sendLabel || 'Uploading…'}</> : 'Choose files'}
     </button>
   )
 
@@ -171,7 +224,7 @@ export function UploadStep({ files, limits, uploading, merging, onAdd, onRemove,
               </div>
               {!empty && (
                 <dl className="upload-summary" aria-label="Summary of added files">
-                  <div><dt>Files</dt><dd>{ready.length} ready{failed > 0 && `, ${failed} skipped`}{converting > 0 && `, ${converting} converting`}</dd></div>
+                  <div><dt>Files</dt><dd>{ready.length} ready{failed > 0 && `, ${failed} skipped`}{converting > 0 && `, ${converting} converting`}{sending.length > 0 && `, ${sending.length} uploading`}</dd></div>
                   <div><dt>Pages</dt><dd>{pages}</dd></div>
                   <div><dt>Combined size</dt><dd>{formatBytes(totalSize)}</dd></div>
                 </dl>
@@ -186,6 +239,12 @@ export function UploadStep({ files, limits, uploading, merging, onAdd, onRemove,
                   <h2>Merge order</h2>
                   <span>Drag the handle to reorder</span>
                 </div>
+                {sending.length > 0 && (
+                  <div className="order-progress">
+                    <div className="order-progress-text"><span>{sendLabel}</span><span>{batchDone.files} of {batchDone.files + sending.length} files</span></div>
+                    <div className="mini-bar" role="progressbar" aria-label="Overall upload progress" aria-valuemin={0} aria-valuemax={100} aria-valuenow={sendPct}><i style={{ width: `${sendPct}%` }} /></div>
+                  </div>
+                )}
                 <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={end}>
                   <SortableContext items={files.map((f) => f.id)} strategy={verticalListSortingStrategy}>
                     <ul className="file-list">
@@ -193,6 +252,11 @@ export function UploadStep({ files, limits, uploading, merging, onAdd, onRemove,
                     </ul>
                   </SortableContext>
                 </DndContext>
+                {uploads.length > 0 && (
+                  <ul className="file-list upload-list">
+                    {uploads.map((u, i) => <UploadRow key={u.key} item={u} index={files.length + i + 1} onRetry={onRetryUpload} onCancel={onCancelUpload} />)}
+                  </ul>
+                )}
                 <div className="order-foot">
                   <span className="tally">
                     <b>{ready.length}</b> ready, <b>{pages}</b> page{pages === 1 ? '' : 's'}

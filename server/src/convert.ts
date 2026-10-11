@@ -67,6 +67,48 @@ async function imageToPdf(srcPath: string, outPath: string): Promise<void> {
   await fs.writeFile(outPath, await doc.save());
 }
 
+/** A throw-away LibreOffice home (user profile + font cache) produced once at start-up. Each conversion gets its own
+ *  private copy, so jobs stay isolated and nothing here is ever used live. Null until the warm-up has finished. */
+let warmHome: string | null = null;
+
+const LO_FLAGS = ['--headless', '--norestore', '--nolockcheck', '--nodefault', '--nologo', '--nofirststartwizard'];
+
+/** Runs one tiny throw-away conversion so LibreOffice generates its profile, then keeps that folder as a template.
+ *  Runs in the background; until it finishes conversions use a fresh profile exactly as before. */
+export async function warmOfficeProfile(): Promise<void> {
+  if (!capabilities.office) return;
+  const t0 = Date.now();
+  const home = path.join(config.dataDir, 'lo-template');
+  const profile = path.join(home, 'profile');
+  const work = path.join(config.dataDir, `lo-warmup-${nanoid(6)}`);
+  try {
+    await rmrf(home);
+    await fs.mkdir(home, { recursive: true });
+    await fs.mkdir(work, { recursive: true });
+    const src = path.join(work, 'warmup.txt');
+    await fs.writeFile(src, 'warm-up');
+    const res = await runProcess(
+      bins.soffice,
+      [`-env:UserInstallation=${pathToFileURL(profile).href}`, ...LO_FLAGS, '--convert-to', 'pdf', '--outdir', work, src],
+      { timeoutMs: config.conversionTimeoutMs, cwd: work, env: childEnv({ HOME: home, USERPROFILE: home }) },
+    );
+    const produced = await fs.stat(path.join(work, 'warmup.pdf')).then(() => true, () => false);
+    const hasProfile = await fs.stat(path.join(profile, 'user')).then(() => true, () => false);
+    if (res.spawnFailed || res.timedOut || !produced || !hasProfile) {
+      await rmrf(home);
+      console.log(`[info] LibreOffice warm-up failed after ${Date.now() - t0} ms; conversions will use a fresh profile each time`);
+      return;
+    }
+    warmHome = home;
+    console.log(`[info] LibreOffice profile warm-up took ${Date.now() - t0} ms`);
+  } catch (e) {
+    console.log(`[info] LibreOffice warm-up error: ${e instanceof Error ? e.message : String(e)}`);
+    await rmrf(home).catch(() => undefined);
+  } finally {
+    await rmrf(work).catch(() => undefined);
+  }
+}
+
 async function officeToPdf(srcPath: string, outPath: string, workDir: string): Promise<void> {
   if (!capabilities.office) {
     throw new HttpError(422, 'Word, Excel and PowerPoint files cannot be converted because LibreOffice is not installed on this server. Convert the file to PDF first, or ask the administrator to install LibreOffice.');
@@ -74,13 +116,18 @@ async function officeToPdf(srcPath: string, outPath: string, workDir: string): P
   const jobDir = path.join(workDir, `lo-${nanoid(10)}`);
   const profile = path.join(jobDir, 'profile');
   const outDir = path.join(jobDir, 'out');
+  await fs.mkdir(jobDir, { recursive: true });
+  if (warmHome) {
+    // Private copy of the pre-generated profile; falls back to an empty profile if the copy fails.
+    await fs.cp(warmHome, jobDir, { recursive: true }).catch(() => undefined);
+  }
   await fs.mkdir(outDir, { recursive: true });
   try {
     const res = await runProcess(
       bins.soffice,
       [
         `-env:UserInstallation=${pathToFileURL(profile).href}`,
-        '--headless', '--norestore', '--nolockcheck', '--nodefault', '--nologo', '--nofirststartwizard',
+        ...LO_FLAGS,
         '--convert-to', 'pdf',
         '--outdir', outDir,
         srcPath,
@@ -99,15 +146,26 @@ async function officeToPdf(srcPath: string, outPath: string, workDir: string): P
 
 export function convertToPdf(srcPath: string, kind: Kind, sessionDir: string, fileId: string): Promise<Converted> {
   return conversionSlots.run(async () => {
-    if (kind === 'pdf') return { pdfPath: srcPath, pageCount: await inspectPdf(srcPath) };
-    const outPath = path.join(sessionDir, 'converted', `${fileId}.pdf`);
-    if (kind === 'image') await imageToPdf(srcPath, outPath);
-    else await officeToPdf(srcPath, outPath, path.join(sessionDir, 'work'));
+    const t0 = Date.now();
+    const sizeKb = await fs.stat(srcPath).then((s) => Math.round(s.size / 1000), () => 0);
+    let outcome = 'ok';
     try {
-      return { pdfPath: outPath, pageCount: await inspectPdf(outPath) };
+      if (kind === 'pdf') return { pdfPath: srcPath, pageCount: await inspectPdf(srcPath) };
+      const outPath = path.join(sessionDir, 'converted', `${fileId}.pdf`);
+      if (kind === 'image') await imageToPdf(srcPath, outPath);
+      else await officeToPdf(srcPath, outPath, path.join(sessionDir, 'work'));
+      try {
+        return { pdfPath: outPath, pageCount: await inspectPdf(outPath) };
+      } catch (e) {
+        await rmrf(outPath);
+        throw e;
+      }
     } catch (e) {
-      await rmrf(outPath);
+      outcome = 'failed';
       throw e;
+    } finally {
+      // Kind, size and time only: never file names or contents.
+      console.log(`[info] convert kind=${kind} size_kb=${sizeKb} ms=${Date.now() - t0} result=${outcome}`);
     }
   });
 }

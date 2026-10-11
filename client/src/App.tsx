@@ -4,7 +4,7 @@ import { ApiError, api, apiUrl, type Capabilities, type ExportResult, type FileI
 import { destroyPdf, loadPdf, pageSizes, type PdfDoc } from './pdf'
 import { toBytes } from './format'
 import type { Paper } from './layout'
-import type { PageItem } from './types'
+import type { PageItem, UploadItem } from './types'
 import { Navbar } from './components/Navbar'
 import { Toasts, type Toast } from './components/Toasts'
 import { UploadStep } from './components/UploadStep'
@@ -16,7 +16,15 @@ import { PoweredBy } from './components/PoweredBy'
 
 type Step = 'upload' | 'edit' | 'finish' | 'processing' | 'result'
 const STEP_INDEX: Record<Step, number> = { upload: 0, edit: 1, finish: 2, processing: 2, result: 2 }
-const EXT_OK = /\.(pdf|docx?|xlsx?|pptx?|jpe?g|png)$/i
+const SUPPORTED_EXT = new Set(['pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'jpg', 'jpeg', 'png'])
+const UPLOAD_CONCURRENCY = 3
+
+/** Only a name with a clearly unsupported alphabetic extension (.txt, .zip, .exe) is refused here. Names with no extension,
+ *  or just digits after a dot ("Scan 12.03"), are sent to the server, which decides by the file's content. */
+function hasUnsupportedExtension(name: string): boolean {
+  const ext = /\.([A-Za-z0-9]{1,6})$/.exec(name)?.[1]?.toLowerCase() ?? ''
+  return ext !== '' && /[a-z]/.test(ext) && !SUPPORTED_EXT.has(ext)
+}
 const DEFAULT_COMPRESS: CompressSettings = { enabled: true, value: '2', unit: 'MB', mode: 'balanced', filename: 'merged_document' }
 
 export default function App() {
@@ -24,7 +32,8 @@ export default function App() {
   const [limits, setLimits] = useState<Limits | null>(null)
   const [files, setFiles] = useState<FileInfo[]>([])
   const [step, setStep] = useState<Step>('upload')
-  const [uploading, setUploading] = useState(false)
+  const [uploads, setUploads] = useState<UploadItem[]>([])
+  const [batchDone, setBatchDone] = useState({ bytes: 0, files: 0 }) // finished uploads of the current batch (keeps the overall bar monotonic)
   const [merging, setMerging] = useState(false)
   const [merge, setMerge] = useState<MergeResult | null>(null)
   const [doc, setDoc] = useState<PdfDoc | null>(null)
@@ -39,6 +48,14 @@ export default function App() {
   const [result, setResult] = useState<ExportResult | null>(null)
   const [toasts, setToasts] = useState<Toast[]>([])
   const toastId = useRef(0)
+  const sessionRef = useRef<string | null>(null)
+  const sessionPromise = useRef<Promise<string> | null>(null)
+  const seqCounter = useRef(0)
+  const seqById = useRef(new Map<string, number>())
+  const fileByKey = useRef(new Map<string, File>())
+  const waitingKeys = useRef<string[]>([])
+  const activeUploads = useRef(0)
+  const aborters = useRef(new Map<string, AbortController>())
   const [theme, setTheme] = useState<'light' | 'dark'>(() => {
     try { const t = localStorage.getItem('maf-theme'); if (t === 'light' || t === 'dark') return t } catch { /* storage unavailable */ }
     return window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
@@ -58,6 +75,10 @@ export default function App() {
   }, [])
 
   const resetAll = useCallback(() => {
+    aborters.current.forEach((a) => a.abort())
+    aborters.current.clear(); fileByKey.current.clear(); waitingKeys.current = []; seqById.current.clear()
+    sessionRef.current = null; sessionPromise.current = null
+    setUploads([])
     setSessionId(null); setFiles([]); setStep('upload'); setMerge(null); setDoc((d) => { destroyPdf(d); return null })
     setSizes([]); setPagesRaw([]); setPaper('original'); setFit(true); setCompress(DEFAULT_COMPRESS)
     setJob(null); setJobError(null); setResult(null)
@@ -75,24 +96,87 @@ export default function App() {
   const setPages = useCallback((u: (p: PageItem[]) => PageItem[]) => setPagesRaw(u), [])
 
   // ---- Upload ----
-  const addFiles = async (list: File[]) => {
-    const okFiles: File[] = []
-    for (const f of list) {
-      if (!EXT_OK.test(f.name)) toast('error', `"${f.name}" is not a supported file type.`)
-      else okFiles.push(f)
+  const patchUpload = (key: string, patch: Partial<UploadItem>) =>
+    setUploads((cur) => cur.map((u) => (u.key === key ? { ...u, ...patch } : u)))
+  const dropUpload = (key: string) => {
+    fileByKey.current.delete(key)
+    setUploads((cur) => cur.filter((u) => u.key !== key))
+  }
+
+  const ensureSession = (): Promise<string> => {
+    if (sessionRef.current) return Promise.resolve(sessionRef.current)
+    if (!sessionPromise.current) {
+      sessionPromise.current = api.createSession()
+        .then((s) => { sessionRef.current = s.id; setSessionId(s.id); setLimits(s.limits); return s.id })
+        .finally(() => { sessionPromise.current = null })
     }
-    if (!okFiles.length) return
-    setUploading(true)
+    return sessionPromise.current
+  }
+
+  const runUpload = async (key: string, seq: number) => {
+    const file = fileByKey.current.get(key)
+    if (!file) return
+    const ac = new AbortController()
+    aborters.current.set(key, ac)
+    patchUpload(key, { status: 'uploading', loaded: 0, error: undefined })
     try {
-      let id = sessionId
-      if (!id) {
-        const s = await api.createSession()
-        id = s.id; setSessionId(s.id); setLimits(s.limits)
-      }
-      const res = await api.upload(id, okFiles)
+      const id = await ensureSession()
+      const res = await api.upload(id, file, { signal: ac.signal, onProgress: (f) => patchUpload(key, { loaded: Math.round(f * file.size) }) })
       res.rejected.forEach((r) => toast('error', `${r.name}: ${r.reason}`))
-      if (res.files.length) setFiles((cur) => [...cur, ...res.files])
-    } catch (e) { fail(e) } finally { setUploading(false) }
+      res.files.forEach((f) => seqById.current.set(f.id, seq))
+      // One update: the row turns from "uploading" into the real file without a flicker or a duplicate.
+      setFiles((cur) => {
+        const fresh = res.files.filter((f) => !cur.some((c) => c.id === f.id))
+        const at = cur.findIndex((c) => (seqById.current.get(c.id) ?? 0) > seq)
+        return at === -1 ? [...cur, ...fresh] : [...cur.slice(0, at), ...fresh, ...cur.slice(at)]
+      })
+      setBatchDone((d) => ({ bytes: d.bytes + file.size, files: d.files + 1 }))
+      dropUpload(key)
+    } catch (e) {
+      if (e instanceof ApiError && e.status === -1) { dropUpload(key); return } // cancelled by the user
+      if (e instanceof ApiError && e.status === 404) { fail(e); return }
+      const msg = e instanceof Error ? e.message : 'The upload failed.'
+      patchUpload(key, { status: 'failed', error: msg })
+    } finally {
+      aborters.current.delete(key)
+    }
+  }
+
+  const pumpUploads = () => {
+    while (activeUploads.current < UPLOAD_CONCURRENCY && waitingKeys.current.length) {
+      const key = waitingKeys.current.shift()!
+      const seq = Number(key.split(':')[0])
+      activeUploads.current++
+      void runUpload(key, seq).finally(() => { activeUploads.current--; pumpUploads() })
+    }
+  }
+
+  const addFiles = (list: File[]) => {
+    const items: UploadItem[] = []
+    for (const f of list) {
+      if (hasUnsupportedExtension(f.name)) { toast('error', `"${f.name}" is not a supported file type.`); continue }
+      const seq = ++seqCounter.current
+      const key = `${seq}:${Math.random().toString(36).slice(2, 8)}`
+      fileByKey.current.set(key, f)
+      items.push({ key, seq, name: f.name, size: f.size, status: 'waiting', loaded: 0 })
+    }
+    if (!items.length) return
+    setUploads((cur) => [...cur, ...items])
+    waitingKeys.current.push(...items.map((i) => i.key))
+    pumpUploads()
+  }
+
+  const cancelUpload = (key: string) => {
+    waitingKeys.current = waitingKeys.current.filter((k) => k !== key)
+    const ac = aborters.current.get(key)
+    if (ac) ac.abort() // runUpload removes the row when the request is aborted
+    else dropUpload(key)
+  }
+
+  const retryUpload = (key: string) => {
+    patchUpload(key, { status: 'waiting', loaded: 0, error: undefined })
+    waitingKeys.current.push(key)
+    pumpUploads()
   }
 
   // Poll conversion status while any file is still being converted.
@@ -203,6 +287,8 @@ export default function App() {
 
   useEffect(() => { window.scrollTo(0, 0) }, [step])
   const retention = limits?.retentionMinutes ?? 30
+  const uploading = uploads.some((u) => u.status !== 'failed')
+  useEffect(() => { if (!uploading) setBatchDone((d) => (d.files || d.bytes ? { bytes: 0, files: 0 } : d)) }, [uploading])
   const wide = step === 'edit' || step === 'result'
 
   return (
@@ -218,8 +304,8 @@ export default function App() {
               </div>
             )}
             <UploadStep
-              files={files} limits={limits} uploading={uploading} merging={merging}
-              onAdd={addFiles} onRemove={removeFile} onReorder={(ids) => setFiles((cur) => ids.map((id) => cur.find((f) => f.id === id)!))}
+              files={files} uploads={uploads} batchDone={batchDone} limits={limits} uploading={uploading} merging={merging}
+              onAdd={addFiles} onRemove={removeFile} onRetryUpload={retryUpload} onCancelUpload={cancelUpload} onReorder={(ids) => setFiles((cur) => ids.map((id) => cur.find((f) => f.id === id)!))}
               onContinue={goEdit}
             />
           </div>

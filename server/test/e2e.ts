@@ -95,6 +95,7 @@ function stop(server: ChildProcess) {
 
 async function startServer(port: number, dataDir: string, env: Record<string, string> = {}): Promise<ChildProcess> {
   const server: ChildProcess = spawn('npx', ['tsx', 'src/index.ts'], {
+    shell: process.platform === 'win32',
     cwd: path.join(import.meta.dirname, '..'),
     env: { ...process.env, PORT: String(port), DATA_DIR: dataDir, SESSION_TTL_MIN: '30', ...env },
     stdio: ['ignore', 'pipe', 'inherit'],
@@ -263,6 +264,41 @@ async function main() {
     check('merging a failed file is refused (409)', bad.status === 409);
     up = await upload(sid, ['img2.png'], { 'img2.png': '../../etc/passwd.png' });
     check('path-traversal filename is neutralised', up.json.files[0]?.name === 'passwd.png', JSON.stringify(up.json));
+
+    console.log('\n[8b] Files without an extension are detected by content');
+    const sidBeforeExt = sid; // section 9 reuses the merged session from section 8
+    sid = await newSession();
+    const noExt: Record<string, string> = {
+      'a.pdf': 'Document from Sukran', 'img2.png': 'Photo 1', 'img1.jpg': 'Scan 12.03',
+      'c.docx': 'Letter', 'd.xlsx': 'Budget', 'e.pptx': 'Slides',
+    };
+    up = await upload(sid, Object.keys(noExt), noExt);
+    const gotExt = Object.fromEntries((up.json.files as any[]).map((f) => [f.name, f.ext]));
+    check('all six extension-less files accepted', up.json.files.length === 6 && up.json.rejected.length === 0, JSON.stringify(up.json));
+    check('PDF gets .pdf appended', gotExt['Document from Sukran.pdf'] === 'pdf', JSON.stringify(gotExt));
+    check('PNG gets .png appended', gotExt['Photo 1.png'] === 'png');
+    check('JPEG gets .jpg appended (name with numeric dot suffix)', gotExt['Scan 12.03.jpg'] === 'jpg');
+    check('DOCX gets .docx appended', gotExt['Letter.docx'] === 'docx');
+    check('XLSX gets .xlsx appended', gotExt['Budget.xlsx'] === 'xlsx');
+    check('PPTX gets .pptx appended', gotExt['Slides.pptx'] === 'pptx');
+    files = await waitFiles(sid);
+    check('extension-less files convert to PDF', files.length === 6 && files.every((f) => f.status === 'ready'), JSON.stringify(files.map((f) => [f.name, f.status, f.error])));
+    up = await upload(sid, ['notes.txt'], { 'notes.txt': 'Notes from phone' });
+    check('extension-less text content rejected', up.json.rejected.length === 1 && /not supported/.test(up.json.rejected[0].reason), JSON.stringify(up.json));
+    up = await upload(sid, ['c.docx'], { 'c.docx': 'report.pdf' });
+    check('.pdf name with DOCX content rejected', up.json.rejected.length === 1 && /does not match/.test(up.json.rejected[0].reason), JSON.stringify(up.json));
+    up = await upload(sid, ['a.pdf'], { 'a.pdf': 'archive.zip' });
+    check('clearly unsupported extension (.zip) rejected even with PDF content', up.json.rejected.length === 1 && /Unsupported file type/.test(up.json.rejected[0].reason), JSON.stringify(up.json));
+    {
+      const cfb = Buffer.concat([Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]), Buffer.alloc(1024)]);
+      const fd = new FormData();
+      fd.append('files', new Blob([cfb]), 'Old document');
+      const res = await fetch(`${BASE}/sessions/${sid}/files`, { method: 'POST', body: fd });
+      const j: any = await res.json();
+      check('legacy Office content without extension gets the rename hint', j.rejected?.length === 1 && /old Office file\. Rename it to end in \.doc, \.xls or \.ppt/.test(j.rejected[0].reason), JSON.stringify(j));
+    }
+
+    sid = sidBeforeExt;
 
     console.log('\n[9] Input validation, session isolation, cleanup');
     const trav = await api('GET', '/sessions/..%2F..%2Fetc');

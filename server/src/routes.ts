@@ -98,26 +98,31 @@ export function buildRouter(): Router {
     const accepted: FileRec[] = [];
     const rejected: Array<{ name: string; reason: string }> = [];
 
-    let total = [...session.files.values()].reduce((n, f) => n + f.size, 0);
+    // Files are registered in session.files as soon as they pass, so these always reflect concurrent upload requests too.
+    const usedBytes = () => [...session.files.values()].reduce((n, x) => n + x.size, 0);
+    const limitReason = (size: number): string | null =>
+      session.files.size >= config.maxFiles ? `You can add up to ${config.maxFiles} files.`
+        : usedBytes() + size > config.maxTotalBytes ? `The total upload limit of ${Math.round(config.maxTotalBytes / 1e6)} MB would be exceeded.`
+          : null;
+
     for (const f of uploaded) {
-      const name = safeDisplayName(Buffer.from(f.originalname, 'latin1').toString('utf8'));
-      let reason: string | null = null;
+      let name = safeDisplayName(Buffer.from(f.originalname, 'latin1').toString('utf8'));
+      let reason: string | null = limitReason(f.size);
       let kind: FileRec['kind'] | null = null;
       let ext = extensionOf(name);
 
-      if (session.files.size + accepted.length >= config.maxFiles) reason = `You can add up to ${config.maxFiles} files.`;
-      else if (total + f.size > config.maxTotalBytes) reason = `The total upload limit of ${Math.round(config.maxTotalBytes / 1e6)} MB would be exceeded.`;
-      else {
+      if (!reason) {
         const v = await validateUpload(name, f.path, f.size);
         if (!v.ok) reason = v.reason;
-        else { kind = v.kind; ext = v.ext; }
+        else { kind = v.kind; ext = v.ext; name = v.name; }
       }
+      // Re-check after the await: another parallel upload request may have been accepted in the meantime.
+      if (!reason && kind) reason = limitReason(f.size);
       if (reason || !kind) {
         await rmrf(f.path);
         rejected.push({ name, reason: reason ?? 'Rejected.' });
         continue;
       }
-      total += f.size;
       const rec: FileRec = { id: nanoid(10), name, ext, kind, size: f.size, status: 'queued', srcPath: f.path };
       session.files.set(rec.id, rec);
       accepted.push(rec);

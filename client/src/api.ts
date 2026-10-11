@@ -59,16 +59,38 @@ async function request<T>(method: string, url: string, body?: unknown, form?: Fo
   return data as T
 }
 
+export interface UploadResponse { files: FileInfo[]; rejected: { name: string; reason: string }[] }
+
+/** Uploads one file with XMLHttpRequest so real byte progress is available (fetch cannot report upload progress). */
+function uploadRequest(id: string, file: File, opts: { onProgress?: (fraction: number) => void; signal?: AbortSignal; timeoutMs?: number }): Promise<UploadResponse> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest()
+    xhr.open('POST', apiUrl(`/api/sessions/${id}/files`))
+    xhr.responseType = 'text'
+    xhr.timeout = opts.timeoutMs ?? 10 * 60_000
+    xhr.upload.onprogress = (e) => { if (e.lengthComputable && e.total > 0) opts.onProgress?.(Math.min(1, e.loaded / e.total)) }
+    xhr.onload = () => {
+      let data: unknown = null
+      try { data = JSON.parse(xhr.responseText) } catch { /* not JSON */ }
+      if (xhr.status >= 200 && xhr.status < 300 && data) resolve(data as UploadResponse)
+      else reject(new ApiError((data as { error?: string } | null)?.error ?? `Upload failed (${xhr.status}).`, xhr.status))
+    }
+    xhr.onerror = () => reject(new ApiError('Cannot reach the server. Check your connection and try again.', 0))
+    xhr.ontimeout = () => reject(new ApiError('The upload took too long and was stopped.', 0))
+    xhr.onabort = () => reject(new ApiError('Upload cancelled.', -1))
+    opts.signal?.addEventListener('abort', () => xhr.abort(), { once: true })
+    const fd = new FormData()
+    fd.append('files', file, file.name)
+    xhr.send(fd)
+  })
+}
+
 export const api = {
   health: () => request<{ ok: boolean; capabilities: Capabilities }>('GET', '/health'),
   createSession: () => request<SessionInfo>('POST', '/sessions'),
   getSession: (id: string) => request<SessionInfo>('GET', `/sessions/${id}`),
   deleteSession: (id: string) => request<void>('DELETE', `/sessions/${id}`),
-  upload: (id: string, files: File[]) => {
-    const fd = new FormData()
-    files.forEach((f) => fd.append('files', f, f.name))
-    return request<{ files: FileInfo[]; rejected: { name: string; reason: string }[] }>('POST', `/sessions/${id}/files`, undefined, fd)
-  },
+  upload: uploadRequest,
   removeFile: (id: string, fileId: string) => request<void>('DELETE', `/sessions/${id}/files/${fileId}`),
   merge: (id: string, order: string[]) => request<MergeResult>('POST', `/sessions/${id}/merge`, { order }),
   startExport: (id: string, body: ExportBody) => request<{ jobId: string }>('POST', `/sessions/${id}/export`, body),

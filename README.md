@@ -62,8 +62,11 @@ Configuration is by environment variables; see [`.env.example`](.env.example) fo
 
 ## How it works
 
-1. **Upload** (`POST /api/sessions/:id/files`): each file is checked server-side: supported extension *and* matching content
-   (magic bytes), size and count limits. Files are stored under random names; the client's filename is only a display label.
+1. **Upload** (`POST /api/sessions/:id/files`): the browser sends each file in its own request (3 in parallel, with real byte
+   progress and a per-file Retry). Each file is checked server-side: supported extension *and* matching content
+   (magic bytes), size and count limits. A name with no extension (phone exports such as "Document from Sam") is accepted when
+   its content is a PDF, JPG, PNG, DOCX, XLSX or PPTX; the detected extension is appended to the name. Legacy Office files need
+   a `.doc`/`.xls`/`.ppt` name. Files are stored under random names; the client's filename is only a display label.
    Accepted files convert in the background (2 at a time); the UI polls and shows Waiting / Converting / Ready / Failed.
    A failed file never affects the others.
 2. **Merge** (`POST …/merge`): converted PDFs are combined in the order the user set.
@@ -132,7 +135,7 @@ The simplest deployment is a single Docker container that serves both the API an
 | `TRUST_PROXY` | `0` | Set to `1` when the host puts one reverse proxy in front of the container (Render, Fly, Railway, nginx, ...). Without it every request appears to come from the proxy's IP and the per-IP rate limits apply to all users together. Use the number of proxy hops; avoid `true`. |
 | `SESSION_TTL_MIN` | `30` | Minutes of inactivity before a session and its files are deleted. |
 | `MAX_FILE_MB`, `MAX_FILES`, `MAX_TOTAL_MB`, `MAX_PAGES`, `MAX_SESSIONS`, `MAX_IMAGE_MEGAPIXELS` | `50`, `20`, `200`, `500`, `200`, `100` | Upload and resource limits. |
-| `RATE_LIMIT_WINDOW_MIN`, `RATE_LIMIT_MAX`, `RATE_LIMIT_HEAVY_MAX` | `15`, `3000`, `120` | Per-IP rate limits. |
+| `RATE_LIMIT_WINDOW_MIN`, `RATE_LIMIT_MAX`, `RATE_LIMIT_HEAVY_MAX` | `15`, `3000`, `300` | Per-IP rate limits. |
 | `GS_BIN`, `SOFFICE_BIN`, `QPDF_BIN` | auto-detect | Not needed in Docker (the tools are on `PATH`). Only for Windows or unusual installs. |
 
 See [`.env.example`](.env.example) for every variable. The server does not read `.env` files; set real environment variables.
