@@ -111,7 +111,7 @@ function UploadRow({ item, index, onRetry, onCancel }: { item: UploadItem; index
       <div className="file-main">
         <div className="file-name" title={item.name}>{item.name}</div>
         <div className="file-meta">
-          {item.status === 'uploading' && <>Uploading · {progressText(item.loaded, item.size)}</>}
+          {item.status === 'uploading' && (item.detail ?? <>Uploading · {progressText(item.loaded, item.size)}</>)}
           {item.status === 'waiting' && <>Waiting to upload · {formatBytes(item.size)}</>}
           {failed && <>{formatBytes(item.size)}</>}
         </div>
@@ -127,7 +127,7 @@ function UploadRow({ item, index, onRetry, onCancel }: { item: UploadItem; index
       </div>
       <span className="file-pages" />
       <span className={`chip ${failed ? 'chip-error' : 'chip-uploading'}`}>
-        {failed ? <><AlertCircle size={13} /> Failed</> : <><Loader2 size={13} className="spin" /> {item.status === 'uploading' ? 'Uploading' : 'Waiting'}</>}
+        {failed ? <><AlertCircle size={13} /> Failed</> : <><Loader2 size={13} className="spin" /> {item.note ?? (item.status === 'uploading' ? 'Uploading' : 'Waiting')}</>}
       </span>
       <button className="icon-btn danger" onClick={() => onCancel(item.key)} aria-label={failed ? `Remove ${item.name}` : `Cancel upload of ${item.name}`}><Trash2 size={16} /></button>
     </li>

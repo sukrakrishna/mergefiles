@@ -197,6 +197,7 @@ export function buildRouter(): Router {
 }
 
 export function errorHandler(err: unknown, _req: Request, res: Response, _next: NextFunction): void {
+  res.locals.errorMessage = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
   if (err instanceof HttpError) { res.status(err.status).json({ error: err.message }); return; }
   if (err instanceof multer.MulterError) {
     const msg =
@@ -207,7 +208,7 @@ export function errorHandler(err: unknown, _req: Request, res: Response, _next: 
     return;
   }
   if ((err as { type?: string })?.type === 'entity.parse.failed') { res.status(400).json({ error: 'Invalid request.' }); return; }
-  console.error(err);
+  console.error('[error] unhandled route error', err);
   res.status(500).json({ error: 'Something went wrong. Please try again.' });
 }
 

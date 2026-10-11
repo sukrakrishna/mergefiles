@@ -48,7 +48,7 @@ export const config = {
   // Rate limiting (per IP, per window)
   rateLimitWindowMs: num(process.env.RATE_LIMIT_WINDOW_MIN, 15) * 60_000,
   rateLimitMax: num(process.env.RATE_LIMIT_MAX, 3000),
-  rateLimitHeavyMax: num(process.env.RATE_LIMIT_HEAVY_MAX, 300),
+  rateLimitHeavyMax: num(process.env.RATE_LIMIT_HEAVY_MAX, 1000),
 
   // External binaries
   sofficeBin: process.env.SOFFICE_BIN ?? '', // empty = auto-detect

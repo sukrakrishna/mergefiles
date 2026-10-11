@@ -201,6 +201,126 @@ with sync_playwright() as p:
     check('no horizontal scroll on mobile (editor)', not mp.evaluate("document.documentElement.scrollWidth > document.documentElement.clientWidth"))
     mp.screenshot(path=os.path.join(SHOTS, '09-mobile-editor.png'), full_page=True)
 
+    print('\n[UI 7] Upload failures: specific messages, retries, slow connection')
+    import io, tempfile, json as _json
+    from PIL import Image
+    from pypdf import PdfWriter, PdfReader as _PR
+    tmpd = tempfile.mkdtemp()
+    # a ~205 KB PDF and a ~4 MB JPEG, as in the phone report
+    w = PdfWriter(); w.append(_PR(os.path.join(FIX, 'a.pdf'))); w.add_attachment('pad.bin', os.urandom(200_000))
+    pdf205 = os.path.join(tmpd, 'report.pdf'); w.write(open(pdf205, 'wb'))
+    rnd = os.urandom(2200 * 1600 * 3)
+    jpg4 = os.path.join(tmpd, 'Photo from phone')  # extension-less on purpose
+    Image.frombytes('RGB', (2200, 1600), rnd).save(jpg4, 'JPEG', quality=97)
+    check('fixtures sizes (~205 KB pdf, ~4 MB jpeg)', 150_000 < os.path.getsize(pdf205) < 260_000 and os.path.getsize(jpg4) > 3_000_000, f'{os.path.getsize(pdf205)} {os.path.getsize(jpg4)}')
+
+    def fresh():
+        c = browser.new_context(viewport={'width': 1100, 'height': 800})
+        pg = c.new_page(); pg.goto(BASE); pg.wait_for_selector('.stage')
+        return c, pg
+    def only_row_text(pg, timeout=40000):
+        pg.wait_for_selector('.file-row.has-error', timeout=timeout)
+        return pg.locator('.file-row.has-error .file-error').first.inner_text().replace('\n', ' ')
+
+    # offline
+    c, pg = fresh()
+    c.set_offline(True)
+    pg.set_input_files('input[type=file]', F('a.pdf'))
+    t = only_row_text(pg, 20000)
+    check('offline shows "You\'re offline."', "You're offline." in t, t)
+    c.set_offline(False)
+    pg.locator('.retry-btn').first.click()
+    expect(pg.locator('.chip-ready')).to_have_count(1, timeout=60000)
+    check('Retry after coming back online succeeds', True)
+    c.close()
+
+    # simulated 503 once -> automatic retry, "Retrying (1/3)…" shown, then success
+    c, pg = fresh()
+    st = {'n': 0}
+    def once_503(route):
+        if route.request.method == 'POST' and route.request.url.endswith('/files') and st['n'] == 0:
+            st['n'] += 1
+            route.fulfill(status=503, content_type='text/html', body='<h1>Service Unavailable</h1>')
+        else:
+            route.continue_()
+    pg.route('**/api/sessions/*/files', once_503)
+    pg.set_input_files('input[type=file]', F('a.pdf'))
+    seen_retry = False
+    for _ in range(60):
+        if pg.get_by_text('Retrying (1/3)').count(): seen_retry = True; break
+        pg.wait_for_timeout(50)
+    check('503 shows "Retrying (1/3)…" on the file row (not Failed)', seen_retry)
+    expect(pg.locator('.chip-ready')).to_have_count(1, timeout=60000)
+    check('upload succeeds after the automatic retry; no Failed row left', pg.locator('.has-error').count() == 0 and st['n'] == 1)
+    c.close()
+
+    # always 503 -> 3 retries then a clear final message
+    c, pg = fresh()
+    cnt = {'n': 0}
+    def always(status, body='{"error":"x"}', ctype='application/json'):
+        def h(route):
+            if route.request.method == 'POST' and route.request.url.endswith('/files'):
+                cnt['n'] += 1
+                route.fulfill(status=status, content_type=ctype, body=body)
+            else:
+                route.continue_()
+        return h
+    pg.route('**/api/sessions/*/files', always(503, '<h1>503</h1>', 'text/html'))
+    pg.set_input_files('input[type=file]', F('a.pdf'))
+    t = only_row_text(pg, 60000)
+    check('persistent 503: message says server is busy or restarting', 'Server is busy or restarting' in t, t)
+    check('persistent 503: 1 try + 3 retries = 4 requests', cnt['n'] == 4, str(cnt['n']))
+    c.close()
+
+    # 413 / 429 / 400 / network drop
+    for status, body, expect_txt, retries in [
+        (413, '{"error":"A file is larger than the 50 MB limit."}', 'File is too large (limit 50 MB).', 0),
+        (429, '{"error":"Too many requests."}', 'Too many requests, wait a minute.', 3),
+        (400, '{"error":"Invalid request."}', 'Invalid request.', 0),
+    ]:
+        c, pg = fresh(); cnt['n'] = 0
+        pg.route('**/api/sessions/*/files', always(status, body))
+        pg.set_input_files('input[type=file]', F('a.pdf'))
+        t = only_row_text(pg, 60000)
+        check(f'HTTP {status}: "{expect_txt}"', expect_txt in t, t)
+        check(f'HTTP {status}: {retries} automatic retries', cnt['n'] == retries + 1, str(cnt['n']))
+        c.close()
+    c, pg = fresh(); cnt['n'] = 0
+    def drop(route):
+        if route.request.method == 'POST' and route.request.url.endswith('/files'):
+            cnt['n'] += 1; route.abort('connectionreset')
+        else: route.continue_()
+    pg.route('**/api/sessions/*/files', drop)
+    pg.set_input_files('input[type=file]', F('a.pdf'))
+    t = only_row_text(pg, 60000)
+    check('network drop: "Connection dropped during upload."', 'Connection dropped during upload.' in t, t)
+    check('network drop: retried 3 times', cnt['n'] == 4, str(cnt['n']))
+    c.close()
+
+    # unreadable file: arrayBuffer() fails -> phone message, and nothing is sent
+    c, pg = fresh(); cnt['n'] = 0
+    pg.add_init_script("File.prototype.arrayBuffer = function () { return Promise.reject(new DOMException('NotReadableError')) }")
+    pg.goto(BASE); pg.wait_for_selector('.stage')
+    pg.route('**/api/sessions/*/files', always(200, '{}'))
+    pg.set_input_files('input[type=file]', F('a.pdf'))
+    t = only_row_text(pg, 20000)
+    check('unreadable file: phone-specific message', "Your phone couldn't read this file" in t, t)
+    check('unreadable file: no upload request was made', cnt['n'] == 0)
+    c.close()
+
+    # Slow 3G: both the 205 KB PDF and the 4 MB extension-less JPEG must arrive
+    c = browser.new_context(viewport={'width': 1100, 'height': 800})
+    pg = c.new_page(); pg.goto(BASE); pg.wait_for_selector('.stage')
+    cdp = c.new_cdp_session(pg); cdp.send('Network.enable')
+    cdp.send('Network.emulateNetworkConditions', {'offline': False, 'latency': 400, 'downloadThroughput': 400 * 1024 // 8, 'uploadThroughput': 400 * 1024 // 8})
+    import time as _t; t0 = _t.time()
+    pg.set_input_files('input[type=file]', [pdf205, jpg4])
+    expect(pg.locator('.chip-ready')).to_have_count(2, timeout=240000)
+    names3g = [x.strip() for x in pg.locator('.file-name').all_inner_texts()]
+    check(f'Slow 3G: 205 KB PDF and 4 MB JPEG both uploaded ({_t.time() - t0:.0f}s)', pg.locator('.has-error').count() == 0)
+    check('Slow 3G: extension-less photo got ".jpg"', 'Photo from phone.jpg' in names3g, str(names3g))
+    c.close()
+
     check('no uncaught page errors', not [e for e in errors if 'favicon' not in e], str(errors[:3]))
     browser.close()
 

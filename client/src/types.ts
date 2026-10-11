@@ -17,4 +17,6 @@ export interface UploadItem {
   status: 'waiting' | 'uploading' | 'failed'
   loaded: number // bytes sent so far (0..size)
   error?: string
+  note?: string // short status shown in the chip: "Retrying (2/3)…", "Waking up the server…"
+  detail?: string // why, shown under the name
 }

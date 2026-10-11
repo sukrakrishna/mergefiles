@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { ArrowUpFromLine, TriangleAlert } from 'lucide-react'
-import { ApiError, api, apiUrl, type Capabilities, type ExportResult, type FileInfo, type JobInfo, type Limits, type MergeResult } from './api'
+import { ApiError, api, apiUrl, readIntoMemory, type Capabilities, type ExportResult, type FileInfo, type JobInfo, type Limits, type MergeResult } from './api'
 import { destroyPdf, loadPdf, pageSizes, type PdfDoc } from './pdf'
 import { toBytes } from './format'
 import type { Paper } from './layout'
@@ -17,7 +17,16 @@ import { PoweredBy } from './components/PoweredBy'
 type Step = 'upload' | 'edit' | 'finish' | 'processing' | 'result'
 const STEP_INDEX: Record<Step, number> = { upload: 0, edit: 1, finish: 2, processing: 2, result: 2 }
 const SUPPORTED_EXT = new Set(['pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'jpg', 'jpeg', 'png'])
-const UPLOAD_CONCURRENCY = 3
+
+const isOffline = () => navigator.onLine === false
+
+/** Mobile networks reset connections when several uploads run at once, so be gentler there. */
+function uploadConcurrency(): number {
+  const c = (navigator as Navigator & { connection?: { effectiveType?: string; saveData?: boolean } }).connection
+  if (c?.saveData || ['slow-2g', '2g', '3g'].includes(c?.effectiveType ?? '')) return 1
+  const mobile = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent) || window.matchMedia?.('(pointer: coarse)').matches
+  return mobile ? 2 : 3
+}
 
 /** Only a name with a clearly unsupported alphabetic extension (.txt, .zip, .exe) is refused here. Names with no extension,
  *  or just digits after a dot ("Scan 12.03"), are sent to the server, which decides by the file's content. */
@@ -49,6 +58,7 @@ export default function App() {
   const [toasts, setToasts] = useState<Toast[]>([])
   const toastId = useRef(0)
   const sessionRef = useRef<string | null>(null)
+  const limitsRef = useRef<Limits | null>(null)
   const sessionPromise = useRef<Promise<string> | null>(null)
   const seqCounter = useRef(0)
   const seqById = useRef(new Map<string, number>())
@@ -77,7 +87,7 @@ export default function App() {
   const resetAll = useCallback(() => {
     aborters.current.forEach((a) => a.abort())
     aborters.current.clear(); fileByKey.current.clear(); waitingKeys.current = []; seqById.current.clear()
-    sessionRef.current = null; sessionPromise.current = null
+    sessionRef.current = null; sessionPromise.current = null; limitsRef.current = null
     setUploads([])
     setSessionId(null); setFiles([]); setStep('upload'); setMerge(null); setDoc((d) => { destroyPdf(d); return null })
     setSizes([]); setPagesRaw([]); setPaper('original'); setFit(true); setCompress(DEFAULT_COMPRESS)
@@ -107,21 +117,44 @@ export default function App() {
     if (sessionRef.current) return Promise.resolve(sessionRef.current)
     if (!sessionPromise.current) {
       sessionPromise.current = api.createSession()
-        .then((s) => { sessionRef.current = s.id; setSessionId(s.id); setLimits(s.limits); return s.id })
+        .then((s) => { sessionRef.current = s.id; limitsRef.current = s.limits; setSessionId(s.id); setLimits(s.limits); return s.id })
         .finally(() => { sessionPromise.current = null })
     }
     return sessionPromise.current
   }
 
   const runUpload = async (key: string, seq: number) => {
-    const file = fileByKey.current.get(key)
+    let file = fileByKey.current.get(key)
     if (!file) return
     const ac = new AbortController()
     aborters.current.set(key, ac)
-    patchUpload(key, { status: 'uploading', loaded: 0, error: undefined })
+    patchUpload(key, { status: 'uploading', loaded: 0, error: undefined, note: undefined, detail: undefined })
     try {
-      const id = await ensureSession()
-      const res = await api.upload(id, file, { signal: ac.signal, onProgress: (f) => patchUpload(key, { loaded: Math.round(f * file.size) }) })
+      file = await readIntoMemory(file) // see api.ts: avoids lazy-stream failures for cloud-backed files on Android
+      fileByKey.current.set(key, file)
+      const picked = file
+      if (isOffline()) throw new ApiError("You're offline.", 0, 'offline')
+      let id: string
+      try {
+        id = await ensureSession()
+      } catch (e) {
+        if (isOffline()) throw new ApiError("You're offline.", 0, 'offline')
+        // The first request after page load can hit a sleeping or restarting instance: wake it before giving up.
+        if (!(e instanceof ApiError) || (e.status !== 0 && e.status < 502)) throw e
+        patchUpload(key, { note: 'Waking up the server…', detail: 'Waking up the server…' })
+        if (!(await api.waitForServer(40_000, ac.signal))) throw e
+        id = await ensureSession()
+        patchUpload(key, { note: undefined, detail: undefined })
+      }
+      const res = await api.upload(id, picked, {
+        signal: ac.signal,
+        maxFileMb: limitsRef.current ? Math.round(limitsRef.current.maxFileBytes / 1e6) : undefined,
+        onProgress: (f) => patchUpload(key, { loaded: Math.round(f * picked.size) }),
+        onRetry: (n, max, why) => patchUpload(key, {
+          loaded: 0, note: `Retrying (${n}/${max})…`,
+          detail: why.kind === 'server-busy' ? 'Server is busy or restarting, retrying…' : why.kind === 'rate-limited' ? 'Too many requests, retrying shortly…' : why.message,
+        }),
+      })
       res.rejected.forEach((r) => toast('error', `${r.name}: ${r.reason}`))
       res.files.forEach((f) => seqById.current.set(f.id, seq))
       // One update: the row turns from "uploading" into the real file without a flicker or a duplicate.
@@ -130,20 +163,20 @@ export default function App() {
         const at = cur.findIndex((c) => (seqById.current.get(c.id) ?? 0) > seq)
         return at === -1 ? [...cur, ...fresh] : [...cur.slice(0, at), ...fresh, ...cur.slice(at)]
       })
-      setBatchDone((d) => ({ bytes: d.bytes + file.size, files: d.files + 1 }))
+      setBatchDone((d) => ({ bytes: d.bytes + picked.size, files: d.files + 1 }))
       dropUpload(key)
     } catch (e) {
-      if (e instanceof ApiError && e.status === -1) { dropUpload(key); return } // cancelled by the user
-      if (e instanceof ApiError && e.status === 404) { fail(e); return }
+      if (e instanceof ApiError && e.kind === 'cancelled') { dropUpload(key); return } // cancelled by the user
+      if (e instanceof ApiError && e.kind === 'expired') { fail(e); return }
       const msg = e instanceof Error ? e.message : 'The upload failed.'
-      patchUpload(key, { status: 'failed', error: msg })
+      patchUpload(key, { status: 'failed', error: msg, note: undefined, detail: undefined })
     } finally {
       aborters.current.delete(key)
     }
   }
 
   const pumpUploads = () => {
-    while (activeUploads.current < UPLOAD_CONCURRENCY && waitingKeys.current.length) {
+    while (activeUploads.current < uploadConcurrency() && waitingKeys.current.length) {
       const key = waitingKeys.current.shift()!
       const seq = Number(key.split(':')[0])
       activeUploads.current++

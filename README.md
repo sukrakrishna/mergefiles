@@ -125,6 +125,16 @@ The simplest deployment is a single Docker container that serves both the API an
 * **Tools:** the app needs LibreOffice, Ghostscript and qpdf. The Docker image installs all three. Without Docker (for example
   on Windows) install them yourself, see [Windows and macOS](#windows-and-macos).
 
+### Reading the logs on Render
+
+* `[upload] POST /api/sessions/:id/files status=… content_length=… ms=… rss_mb=…` is logged for every upload. `status=aborted`
+  means the client or a proxy closed the connection before the response; `error="…"` shows what the server threw.
+* `[info] startup rss … MB` appearing again means the instance restarted (redeploy, crash or out of memory). Sessions are kept in
+  memory, so a restart ends them. `[fatal] uncaughtException` / `[error] unhandledRejection` carry a stack trace.
+* `[info] SIGTERM: no new connections…` / `all connections closed` show a graceful redeploy: in-flight uploads get up to 25 s.
+* The server sets `keepAliveTimeout=65 s`, `headersTimeout=66 s` and no request timeout, so it outlasts the proxy's idle timeout
+  and slow mobile uploads are not cut off.
+
 ### Server (Docker or any Node host)
 
 | Variable | Default | Purpose |
@@ -135,7 +145,7 @@ The simplest deployment is a single Docker container that serves both the API an
 | `TRUST_PROXY` | `0` | Set to `1` when the host puts one reverse proxy in front of the container (Render, Fly, Railway, nginx, ...). Without it every request appears to come from the proxy's IP and the per-IP rate limits apply to all users together. Use the number of proxy hops; avoid `true`. |
 | `SESSION_TTL_MIN` | `30` | Minutes of inactivity before a session and its files are deleted. |
 | `MAX_FILE_MB`, `MAX_FILES`, `MAX_TOTAL_MB`, `MAX_PAGES`, `MAX_SESSIONS`, `MAX_IMAGE_MEGAPIXELS` | `50`, `20`, `200`, `500`, `200`, `100` | Upload and resource limits. |
-| `RATE_LIMIT_WINDOW_MIN`, `RATE_LIMIT_MAX`, `RATE_LIMIT_HEAVY_MAX` | `15`, `3000`, `300` | Per-IP rate limits. |
+| `RATE_LIMIT_WINDOW_MIN`, `RATE_LIMIT_MAX`, `RATE_LIMIT_HEAVY_MAX` | `15`, `3000`, `1000` | Per-IP rate limits. |
 | `GS_BIN`, `SOFFICE_BIN`, `QPDF_BIN` | auto-detect | Not needed in Docker (the tools are on `PATH`). Only for Windows or unusual installs. |
 
 See [`.env.example`](.env.example) for every variable. The server does not read `.env` files; set real environment variables.

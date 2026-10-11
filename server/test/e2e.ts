@@ -298,6 +298,14 @@ async function main() {
       check('legacy Office content without extension gets the rename hint', j.rejected?.length === 1 && /old Office file\. Rename it to end in \.doc, \.xls or \.ppt/.test(j.rejected[0].reason), JSON.stringify(j));
     }
 
+    {
+      const hh = await fetch(`${BASE}/health`);
+      check('keep-alive is 65 s (longer than the hosting proxy idle timeout)', /timeout=65/.test(hh.headers.get('keep-alive') ?? ''), String(hh.headers.get('keep-alive')));
+      const big = new FormData();
+      big.append('files', new Blob([Buffer.alloc(10)]), 'x.pdf');
+      const noSession = await fetch(`${BASE}/sessions/AAAAAAAAAAAAAAAAAAAAA/files`, { method: 'POST', body: big });
+      check('upload to an unknown session returns JSON 404 (never a dropped connection)', noSession.status === 404 && typeof (await noSession.json() as any).error === 'string');
+    }
     sid = sidBeforeExt;
 
     console.log('\n[9] Input validation, session isolation, cleanup');
