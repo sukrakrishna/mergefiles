@@ -105,6 +105,23 @@ target in those modes; the result then suggests Smallest Size or a larger target
 MergeAnyFile can run as one process (Express serves the built UI, the default) or split: the React client on a static host such
 as Vercel and the Node server in a container elsewhere (the included `Dockerfile` has LibreOffice, Ghostscript and qpdf installed).
 
+### One container on Render (API and website together)
+
+The simplest deployment is a single Docker container that serves both the API and the website; no client hosting or CORS setup is needed.
+
+* **Render:** New → Web Service → connect this repository → Runtime **Docker** (it uses the root `Dockerfile`).
+  Region **Singapore**, an instance type with **at least 2 GB RAM** (LibreOffice and Ghostscript are memory-hungry), **1 instance**
+  (sessions live in memory and on local disk, so do not scale out).
+  Environment: `TRUST_PROXY=1`. Health check path: `/api/health`.
+* **Locally with Docker:**
+  ```bash
+  docker build -t mergeanyfile .
+  docker run --rm -p 3001:3001 -v maf-data:/data mergeanyfile
+  ```
+  Then open http://localhost:3001.
+* **Tools:** the app needs LibreOffice, Ghostscript and qpdf. The Docker image installs all three. Without Docker (for example
+  on Windows) install them yourself, see [Windows and macOS](#windows-and-macos).
+
 ### Server (Docker or any Node host)
 
 | Variable | Default | Purpose |
